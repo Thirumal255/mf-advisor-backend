@@ -22,8 +22,28 @@ app.add_middleware(
 # Load Data
 # ---------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parents
-DATA_FILE = BASE_DIR / "data" / "scheme_metrics_merged.json"
+
+# Smart path that works everywhere
+def get_data_file_path():
+    # Option 1: Same level as main.py
+    option1 = Path(__file__).resolve().parent / "data" / "scheme_metrics_merged.json"
+    if option1.exists():
+        return option1
+    
+    # Option 2: One level up
+    option2 = Path(__file__).resolve().parent.parent / "data" / "scheme_metrics_merged.json"
+    if option2.exists():
+        return option2
+    
+    # Option 3: Two levels up
+    option3 = Path(__file__).resolve().parent.parent.parent / "data" / "scheme_metrics_merged.json"
+    if option3.exists():
+        return option3
+    
+    # Default to option 1
+    return option1
+
+DATA_FILE = get_data_file_path()
 
 FUNDS_DATA = {}
 
