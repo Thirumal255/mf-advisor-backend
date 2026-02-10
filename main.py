@@ -45,11 +45,33 @@ def get_data_file_path():
 
 DATA_FILE = get_data_file_path()
 
+# Load NAV Data
+
+def get_nav_data_file_path():
+    # Option 1: Same level as main.py
+    option1 = Path(__file__).resolve().parent / "data" / "parent_scheme_nav.json"
+    if option1.exists():
+        return option1
+    
+    # Option 2: One level up
+    option2 = Path(__file__).resolve().parent.parent / "data" / "parent_scheme_nav.json"
+    if option2.exists():
+        return option2
+    
+    # Option 3: Two levels up
+    option3 = Path(__file__).resolve().parent.parent.parent / "data" / "parent_scheme_nav.json"
+    if option3.exists():
+        return option3
+    
+    # Default to option 1
+    return option1
+
+NAV_DATA_FILE = get_nav_data_file_path()
+
 FUNDS_DATA = {}
 
 
 # Load NAV Data
-NAV_DATA_FILE = BASE_DIR / "data" / "parent_scheme_nav.json"
 NAV_DATA_MAP = {}
 
 def load_nav_data():
