@@ -22,7 +22,7 @@ app.add_middleware(
 # Load Data
 # ---------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+BASE_DIR = Path(__file__).resolve().parents
 DATA_FILE = BASE_DIR / "data" / "scheme_metrics_merged.json"
 
 FUNDS_DATA = {}
