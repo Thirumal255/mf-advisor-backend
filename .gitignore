@@ -8,4 +8,3 @@ env/
 venv/
 *.log
 .DS_Store
-data/parent_scheme_nav.json

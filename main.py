@@ -66,7 +66,8 @@ def get_nav_data_file_path():
     # Default to option 1
     return option1
 
-NAV_DATA_FILE = get_nav_data_file_path()
+#NAV_DATA_FILE = get_nav_data_file_path()
+NAV_DATA_FILE={}
 
 FUNDS_DATA = {}
 
