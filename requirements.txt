@@ -1,22 +1,46 @@
+# Core Framework
 fastapi
 uvicorn[standard]
-mftool
+pydantic
+python-dotenv
+
+# Database
+psycopg2-binary
+
+# Data Processing
 pandas
-numpy
-cachetools
-python-multipart
-pdfplumber
-PyMuPDF
-deprecated
-rapidfuzz
-pytest
+numpy>=1.24.0,<2.0.0
 pyarrow
 fastparquet
+
+# Mutual Fund Tools
+mftool
+yfinance
+
+# PDF/Document Processing
+pdfplumber
+PyMuPDF
+pypdf
+python-multipart
+
+# AI/ML
 openai
+faiss-cpu==1.7.4
+
+# Google Cloud
+google-cloud-storage==2.14.0
+
+
+# Utilities
+cachetools
+deprecated
+rapidfuzz
 jinja2
 itsdangerous
+requests
+
+# Auth
 python-jose[cryptography]
-python-dotenv
-pypdf
-yfinance
-pydantic
+
+# Testing
+pytest

@@ -1,13 +1,24 @@
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import json
-
+from fastapi import HTTPException
 from datetime import datetime, timedelta
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional,List
+import difflib
+from routers.chat import router as chat_router
+from routers.analytics import router as analytics_router
+from services.llm_service import get_llm_provider, MFBESTIE_SYSTEM_PROMPT
+from google.cloud import storage
 
 app = FastAPI(title="MF Advisor API", version="1.0")
+
+app.include_router(chat_router)
+app.include_router(analytics_router)
 
 # CORS Configuration
 app.add_middleware(
@@ -66,38 +77,67 @@ def get_nav_data_file_path():
     # Default to option 1
     return option1
 
-#NAV_DATA_FILE = get_nav_data_file_path()
-NAV_DATA_FILE={}
+NAV_DATA_FILE = get_nav_data_file_path()
+
 
 FUNDS_DATA = {}
 
 
-# Load NAV Data
-NAV_DATA_MAP = {}
 
-def load_nav_data():
-    """Load NAV data into memory for fast lookup"""
-    global NAV_DATA_MAP
+
+
+# Database connection
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL")
+    #database_url = "postgresql://postgres:admin@localhost:5432/mf_advisor"
+    if not database_url:
+        raise Exception("DATABASE_URL not set")
+    conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+    return conn
+
+
+# ---------------------------------------------------
+# NAV Data from PostgreSQL
+# ---------------------------------------------------
+
+def get_nav_from_db(scheme_code: int):
+    """Get NAV data for a scheme from PostgreSQL"""
     try:
-        with open(NAV_DATA_FILE, 'r', encoding='utf-8') as f:
-            nav_data_raw = json.load(f)
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        # Create fast lookup map: {scheme_code: {name, data}}
-        for scheme in nav_data_raw:
-            scheme_code = scheme['meta']['scheme_code']
-            NAV_DATA_MAP[scheme_code] = {
-                'name': scheme['meta']['scheme_name'],
-                'fund_house': scheme['meta'].get('fund_house', ''),
-                'data': scheme['data']  # List of {date, nav}
-            }
+        cursor.execute("""
+            SELECT nav_date, nav_value, scheme_name, fund_house
+            FROM scheme_nav 
+            WHERE scheme_code = %s
+            ORDER BY nav_date DESC
+        """, (str(scheme_code),))
         
-        print(f"✅ Loaded NAV data for {len(NAV_DATA_MAP)} schemes from {NAV_DATA_FILE}")
-    except FileNotFoundError:
-        print(f"❌ NAV data file not found: {NAV_DATA_FILE}")
-        NAV_DATA_MAP = {}
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not results:
+            return None
+        
+        # Convert to format matching old NAV_DATA_MAP
+        return {
+            'name': results[0]['scheme_name'],
+            'fund_house': results[0]['fund_house'],
+            'data': [
+                {
+                    'date': row['nav_date'].strftime('%d-%m-%Y'),
+                    'nav': str(row['nav_value'])
+                }
+                for row in results
+            ]
+        }
     except Exception as e:
-        print(f"❌ Error loading NAV data: {e}")
-        NAV_DATA_MAP = {}
+        print(f"❌ Error fetching NAV for scheme {scheme_code}: {e}")
+        return None
+
+
+
 
 
 # ---------------------------------------------------
@@ -118,6 +158,30 @@ def get_category_emoji(main_category):
 
 def load_data():
     global FUNDS_DATA
+    
+    # 1. Detect if we are running in Google Cloud Run
+    is_cloud_run = os.environ.get('K_SERVICE') is not None
+    
+    # 2. If in the cloud, download the file from GCS first
+    if is_cloud_run:
+        print("☁️ Running in Cloud Run! Downloading data from GCS...")
+        try:
+            # Ensure the /app/data directory exists
+            os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+            
+            # Connect to GCS and download the file
+            storage_client = storage.Client()
+            bucket = storage_client.bucket("run-sources-mf-advisor-487108-asia-south1")
+            blob = bucket.blob("scheme_metrics_merged.json")
+            
+            blob.download_to_filename(DATA_FILE)
+            print("✅ Successfully downloaded scheme_metrics_merged.json from GCS")
+        except Exception as e:
+            print(f"❌ Failed to download from GCS: {e}")
+    else:
+        print("💻 Running locally. Skipping GCS download.")
+
+    # 3. Load the data into memory (Works for both Cloud and Local)
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             FUNDS_DATA = json.load(f)
@@ -127,7 +191,6 @@ def load_data():
         FUNDS_DATA = {}
 
 load_data()
-load_nav_data()
 
 # ---------------------------------------------------
 # Helper: Calculate Composite Score (for ranking)
@@ -304,13 +367,14 @@ def format_date(dt: datetime) -> str:
 
 def get_nav_on_date(scheme_code: int, investment_date: str):
     """
-    Get NAV for a scheme on a specific date
+    Get NAV for a scheme on a specific date (from PostgreSQL)
     Returns None if date is before fund started
     """
-    if scheme_code not in NAV_DATA_MAP:
+    nav_scheme = get_nav_from_db(scheme_code)
+    
+    if not nav_scheme:
         return None
     
-    nav_scheme = NAV_DATA_MAP[scheme_code]
     target_date = parse_date(investment_date)
     
     # Get fund start date (oldest NAV date)
@@ -366,13 +430,10 @@ def get_nav_on_date(scheme_code: int, investment_date: str):
     return None
 
 def get_current_nav(scheme_code: int):
-    """Get the most recent NAV for a scheme"""
-    if scheme_code not in NAV_DATA_MAP:
-        return None
+    """Get the most recent NAV for a scheme (from PostgreSQL)"""
+    nav_scheme = get_nav_from_db(scheme_code)
     
-    nav_scheme = NAV_DATA_MAP[scheme_code]
-    
-    if not nav_scheme['data']:
+    if not nav_scheme or not nav_scheme['data']:
         return None
     
     # Sort by date to get latest
@@ -387,96 +448,193 @@ def get_current_nav(scheme_code: int):
         'date': sorted_data[0]['date']
     }
 
-def calculate_returns(scheme_code: int, investment_amount: float, investment_date: str):
+
+def calculate_returns(scheme_code: int, investment_amount: float, investment_date: str, investment_type: str = "Lumpsum"):
     """
-    Calculate investment returns for a single fund
-    
-    Returns:
-    - Units purchased
-    - Current value
-    - Absolute returns
-    - Return percentage
-    - XIRR (annualized return)
+    Calculate investment returns for a single fund.
+    Handles both 'Lumpsum' and 'SIP' (monthly installments).
     """
-    # Get NAVs
-    purchase_nav_data = get_nav_on_date(scheme_code, investment_date)
-    current_nav_data = get_current_nav(scheme_code)
+    # 1. Fetch all NAVs from PostgreSQL
+    nav_scheme = get_nav_from_db(scheme_code)
     
-    # Check if purchase NAV data is invalid (None)
-    if not purchase_nav_data:
+    if not nav_scheme or not nav_scheme.get('data'):
+        return {'error': True, 'message': f'NAV data not available for scheme {scheme_code}'}
+    
+    # 2. Convert to datetime for easy sorting and comparison
+    parsed_navs = []
+    for entry in nav_scheme['data']:
+        parsed_navs.append({
+            'nav': float(entry['nav']),
+            'date_str': entry['date'],
+            'date': parse_date(entry['date'])
+        })
+        
+    # Sort descending (newest first)
+    parsed_navs.sort(key=lambda x: x['date'], reverse=True)
+    
+    current_nav_data = parsed_navs[0]
+    target_date = parse_date(investment_date)
+    fund_start_date = parsed_navs[-1]['date']
+    
+    # Validation: Cannot invest before fund started
+    if target_date < fund_start_date:
         return {
             'error': True,
-            'message': f'NAV data not available for scheme {scheme_code} on {investment_date}'
+            'error_type': 'BEFORE_FUND_START',
+            'fund_start_date': format_date(fund_start_date),
+            'message': f'Fund started on {format_date(fund_start_date)}, which is after the investment date'
         }
-    
-    # ✅ NEW: Check if purchase NAV returned an error
-    if purchase_nav_data.get('error'):
-        return purchase_nav_data  # Return the error as-is
-    
-    # Check if current NAV data is invalid (None)
-    if not current_nav_data:
+
+    # Helper function to find NAV on or before a given date
+    def get_nearest_nav(t_date):
+        for entry in parsed_navs:
+            if entry['date'] <= t_date:
+                return entry
+        return parsed_navs[-1]
+
+    # ---------------------------------------------------------
+    # SIP LOGIC (Monthly accumulation)
+    # ---------------------------------------------------------
+    if investment_type.upper().strip() == "SIP":
+        total_units = 0.0
+        total_invested = 0.0
+        sip_date = target_date
+        current_date = current_nav_data['date']
+        
+        while sip_date <= current_date:
+            nav_entry = get_nearest_nav(sip_date)
+            total_units += investment_amount / nav_entry['nav']
+            total_invested += investment_amount
+            
+            # Move to next month safely (handles leap years & month ends)
+            month = sip_date.month - 1 + 1
+            year = sip_date.year + month // 12
+            month = month % 12 + 1
+            max_day = [31, 29 if year%4==0 and (year%100!=0 or year%400==0) else 28, 31,30,31,30,31,31,30,31,30,31][month-1]
+            day = min(target_date.day, max_day) # Keeps your original SIP day
+            
+            sip_date = datetime(year, month, day)
+
+        current_value = total_units * current_nav_data['nav']
+        absolute_returns = current_value - total_invested
+        return_percentage = (absolute_returns / total_invested) * 100 if total_invested > 0 else 0
+        
+        # Simple XIRR approximation for SIP
+        days_invested = (current_date - target_date).days
+        years_invested = days_invested / 365.25
+        xirr = 0 
+        if years_invested > 0:
+            # SIP is distributed, so average time invested is roughly half
+            xirr = ((current_value / total_invested) ** (1 / (years_invested / 2)) - 1) * 100
+
         return {
-            'error': True,
-            'message': f'Current NAV data not available for scheme {scheme_code}'
+            'error': False,
+            'scheme_code': scheme_code,
+            'scheme_name': nav_scheme['name'],
+            'investment': {
+                'amount': round(total_invested, 2), # Correct total across all months!
+                'monthly_sip': investment_amount,
+                'date': investment_date,
+            },
+            'current': {
+                'nav': current_nav_data['nav'],
+                'date': current_nav_data['date_str'],
+                'value': round(current_value, 2)
+            },
+            'returns': {
+                'absolute': round(absolute_returns, 2),
+                'percentage': round(return_percentage, 2),
+                'xirr': round(xirr, 2) if isinstance(xirr, (int, float)) else 0
+            }
         }
-    
-    # ✅ NEW: Check if current NAV returned an error
-    if current_nav_data.get('error'):
-        return current_nav_data  # Return the error as-is
-    
-    # Now safe to access 'nav' key
-    purchase_nav = purchase_nav_data['nav']
-    current_nav = current_nav_data['nav']
-    
-    # Calculate units
-    units = investment_amount / purchase_nav
-    
-    # Calculate current value
-    current_value = units * current_nav
-    
-    # Calculate returns
-    absolute_returns = current_value - investment_amount
-    return_percentage = (absolute_returns / investment_amount) * 100
-    
-    # Calculate XIRR (annualized return)
-    purchase_date = parse_date(investment_date)
-    current_date = parse_date(current_nav_data['date'])
-    days = (current_date - purchase_date).days
-    years = days / 365.25
-    
-    if years > 0:
-        xirr = (pow(current_value / investment_amount, 1 / years) - 1) * 100
+        
+    # ---------------------------------------------------------
+    # LUMPSUM LOGIC (One-time investment)
+    # ---------------------------------------------------------
     else:
-        xirr = 0
-    
-    return {
-        'error': False,
-        'scheme_code': scheme_code,
-        'scheme_name': NAV_DATA_MAP[scheme_code]['name'],
-        'fund_house': NAV_DATA_MAP[scheme_code]['fund_house'],
-        'investment': {
-            'amount': round(investment_amount, 2),
-            'date': investment_date,
-            'purchase_nav': round(purchase_nav, 4),
-            'purchase_date': purchase_nav_data['date'],
-            'exact_date_match': purchase_nav_data.get('exact_match', False)
-        },
-        'current': {
-            'nav': round(current_nav, 4),
-            'date': current_nav_data['date'],
-            'value': round(current_value, 2)
-        },
-        'returns': {
-            'absolute': round(absolute_returns, 2),
-            'percentage': round(return_percentage, 2),
-            'xirr': round(xirr, 2)
-        },
-        'metrics': {
-            'units': round(units, 4),
-            'duration_days': days,
-            'duration_years': round(years, 2)
+        purchase_nav_data = get_nearest_nav(target_date)
+        purchase_nav = purchase_nav_data['nav']
+        current_nav = current_nav_data['nav']
+        
+        units = investment_amount / purchase_nav
+        current_value = units * current_nav
+        
+        absolute_returns = current_value - investment_amount
+        return_percentage = (absolute_returns / investment_amount) * 100
+        
+        days = (current_nav_data['date'] - target_date).days
+        years = days / 365.25
+        xirr = (pow(current_value / investment_amount, 1 / years) - 1) * 100 if years > 0 else 0
+        
+        return {
+            'error': False,
+            'scheme_code': scheme_code,
+            'scheme_name': nav_scheme['name'],
+            'investment': {
+                'amount': round(investment_amount, 2),
+                'date': investment_date,
+                'purchase_nav': round(purchase_nav, 4)
+            },
+            'current': {
+                'nav': round(current_nav, 4),
+                'date': current_nav_data['date_str'],
+                'value': round(current_value, 2)
+            },
+            'returns': {
+                'absolute': round(absolute_returns, 2),
+                'percentage': round(return_percentage, 2),
+                'xirr': round(xirr, 2)
+            }
         }
-    }
+
+
+
+# ===================================================
+# PORTFOLIO VIBE CHECK MODELS & ENDPOINT
+# ===================================================
+
+class PortfolioItem(BaseModel):
+    fund_name: str
+    amfi_code: Optional[int] = None  # Made optional so users can just pass names
+    investment_type: str  # "SIP" or "Lumpsum"
+    invested_date: str    # DD-MM-YYYY
+    invested_amount: float
+
+class PortfolioAnalysisRequest(BaseModel):
+    items: List[PortfolioItem]
+
+def find_best_fund_match(query_name: str) -> Optional[int]:
+    """
+    Intelligently finds the best matching AMFI code for a given fund name.
+    Uses Exact Match -> Substring Match -> Fuzzy Matching.
+    """
+    if not query_name:
+        return None
+        
+    query = query_name.lower().strip()
+    
+    # 1. Exact Match
+    for name, data in FUNDS_DATA.items():
+        if name.lower() == query:
+            return data.get("canonical_code")
+            
+    # 2. Substring Match (e.g., User types "HDFC Small Cap", we match "HDFC Small Cap Fund - Direct Plan")
+    candidates = [name for name in FUNDS_DATA.keys() if query in name.lower()]
+    if candidates:
+        # Sort by length ascending so we get the cleanest match (avoids picking IDCW if Direct Growth exists)
+        candidates.sort(key=len)
+        return FUNDS_DATA[candidates[0]].get("canonical_code")
+        
+    # 3. Fuzzy Matching (Catches typos like "Parag Parik" instead of "Parag Parikh")
+    all_names = list(FUNDS_DATA.keys())
+    matches = difflib.get_close_matches(query_name, all_names, n=1, cutoff=0.4)
+    if matches:
+        return FUNDS_DATA[matches[0]].get("canonical_code")
+        
+    return None
+
+
+
 
 
 # Request model for investment comparison
@@ -485,6 +643,7 @@ class InvestmentComparisonRequest(BaseModel):
     fund2_code: int
     investment_date: str  # DD-MM-YYYY
     investment_amount: float
+    investment_type: str = "LUMPSUM"  # 🟢 Added default value
 
 # ---------------------------------------------------
 # Endpoint 1: Health Check (Enhanced)
@@ -1047,33 +1206,14 @@ def compare_funds(fund1_code: str, fund2_code: str):
 @app.post("/api/compare-investment")
 def compare_investment(request: InvestmentComparisonRequest):
     """
-    Compare investment returns between two funds
-    
-    Request Body:
-    {
-        "fund1_code": 119551,  // User's current fund
-        "fund2_code": 100646,  // Recommended fund
-        "investment_date": "01-01-2023",  // DD-MM-YYYY
-        "investment_amount": 50000
-    }
-    
-    Response:
-    {
-        "fund1": { /* returns data */ },
-        "fund2": { /* returns data */ },
-        "comparison": {
-            "value_difference": 7780.50,
-            "percentage_difference": 15.23,
-            "xirr_difference": 2.45,
-            "is_fund2_better": true
-        }
-    }
+    Compare investment returns between two funds (Handles SIP and Lumpsum)
     """
     try:
         fund1_code = request.fund1_code
         fund2_code = request.fund2_code
         investment_date = request.investment_date
         investment_amount = request.investment_amount
+        investment_type = request.investment_type  # 🟢 Extract the type
         
         # Validation: Amount
         if investment_amount <= 0:
@@ -1102,43 +1242,41 @@ def compare_investment(request: InvestmentComparisonRequest):
             raise HTTPException(400, "Investment date must be at least 1 month old for accurate comparison")
         
         # Validation: Funds exist in NAV data
-        if fund1_code not in NAV_DATA_MAP:
+        if not get_nav_from_db(fund1_code):
             raise HTTPException(404, f"Fund 1 (code: {fund1_code}) not found in NAV database")
-        
-        if fund2_code not in NAV_DATA_MAP:
+
+        if not get_nav_from_db(fund2_code):
             raise HTTPException(404, f"Fund 2 (code: {fund2_code}) not found in NAV database")
         
-        # Calculate returns for Fund 1 (User's fund)
-        fund1_returns = calculate_returns(fund1_code, investment_amount, investment_date)
+        # 🟢 Calculate returns for Fund 1 (Pass investment_type)
+        fund1_returns = calculate_returns(fund1_code, investment_amount, investment_date, investment_type)
 
-        # Check if Fund 1 investment date is invalid
-        # Check if Fund 1 investment date is invalid
         if fund1_returns.get('error'):
             error_msg = fund1_returns.get('message', 'Invalid investment date')
             
             # If it's a "before fund start" error, provide clear guidance
             if fund1_returns.get('error_type') == 'BEFORE_FUND_START':
                 fund_start = fund1_returns.get('fund_start_date', 'unknown')
-                fund_name = NAV_DATA_MAP.get(fund1_code, {}).get('name', 'Your fund')
+                fund_name = get_nav_from_db(fund1_code)['name'] if get_nav_from_db(fund2_code) else 'Your fund'
                 error_msg = f"{fund_name} started on {fund_start}. Please select a date after this."
     
             raise HTTPException(400, error_msg)
-        # Calculate returns for Fund 2 (Recommended fund)
-        fund2_returns = calculate_returns(fund2_code, investment_amount, investment_date)
+            
+        # 🟢 Calculate returns for Fund 2 (Pass investment_type)
+        fund2_returns = calculate_returns(fund2_code, investment_amount, investment_date, investment_type)
 
         # Handle Case 2: Fund 2 started after investment date
         adjusted_comparison = False
         original_investment_date = investment_date
 
         if fund2_returns.get('error') and fund2_returns.get('error_type') == 'BEFORE_FUND_START':
-            # Fund 2 started later - adjust comparison
             fund2_start_date = fund2_returns.get('fund_start_date')
             
-            # Recalculate Fund 2 from its start date
-            fund2_returns = calculate_returns(fund2_code, investment_amount, fund2_start_date)
+            # 🟢 Recalculate Fund 2 from its start date (Pass investment_type)
+            fund2_returns = calculate_returns(fund2_code, investment_amount, fund2_start_date, investment_type)
             
-            # Also recalculate Fund 1 from Fund 2's start date for fair comparison
-            fund1_adjusted = calculate_returns(fund1_code, investment_amount, fund2_start_date)
+            # 🟢 Recalculate Fund 1 from Fund 2's start date for fair comparison (Pass investment_type)
+            fund1_adjusted = calculate_returns(fund1_code, investment_amount, fund2_start_date, investment_type)
             
             if fund1_adjusted.get('error'):
                 raise HTTPException(400, {
@@ -1188,6 +1326,7 @@ def compare_investment(request: InvestmentComparisonRequest):
             },
             "adjustment": adjustment_info, 
             "meta": {
+                "investment_type": investment_type,
                 "investment_amount": investment_amount,
                 "investment_date": investment_date,
                 "calculation_date": format_date(datetime.now())
@@ -1199,6 +1338,43 @@ def compare_investment(request: InvestmentComparisonRequest):
     except Exception as e:
         print(f"❌ Error in compare_investment: {e}")
         raise HTTPException(500, f"Internal server error: {str(e)}")
+
+
+
+@app.get("/debug/scheme-codes")
+async def debug_scheme_codes(limit: int = 20):
+    """Debug endpoint to see what scheme codes are in PostgreSQL"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get sample scheme codes from database
+        cursor.execute("""
+            SELECT DISTINCT scheme_code, scheme_name, fund_house
+            FROM scheme_nav 
+            ORDER BY scheme_code
+            LIMIT %s
+        """, (limit,))
+        
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return {
+            "total_checked": len(results),
+            "sample_codes": [
+                {
+                    "code": row['scheme_code'],
+                    "name": row['scheme_name'],
+                    "fund_house": row['fund_house']
+                }
+                for row in results
+            ]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 
 
 
@@ -1219,6 +1395,299 @@ def debug_routes():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+"""
+EXPENSE IMPACT ENDPOINT - WITH VALIDATION
+Requires actual expense ratio data from fund
+Does NOT calculate if expense data is missing
+"""
+
+from pydantic import BaseModel
+from typing import Optional
+from fastapi import HTTPException
+
+class ExpenseImpactRequest(BaseModel):
+    scheme_code: int
+    amount: float
+    duration_years: int
+    investment_type: str = "lumpsum"
+    sip_amount: Optional[float] = None
+
+@app.post("/api/expense-impact")
+async def calculate_expense_impact(request: ExpenseImpactRequest):
+    """Calculate impact of expense ratio: Direct vs Regular plan"""
+    
+    # Get fund data from FUNDS_DATA
+    fund_data = None
+    fund_name = None
+    
+    for name, data in FUNDS_DATA.items():
+        if str(data.get("canonical_code")) == str(request.scheme_code):
+            fund_data = data
+            fund_name = name
+            break
+    
+    if not fund_data:
+        raise HTTPException(status_code=404, detail="Fund not found")
+    
+    # Get metrics
+    metrics = fund_data.get("metrics", {})
+    
+    # ✅ VALIDATION: Check if expense ratio data exists
+    annual_expense = fund_data.get("annual_expense")
+    
+    # Check if we have valid expense data
+    has_expense_data = False
+    direct_expense = None
+    regular_expense = None
+    
+    if annual_expense and isinstance(annual_expense, dict):
+        direct_str = annual_expense.get("Direct")
+        regular_str = annual_expense.get("Regular")
+        
+        if direct_str and regular_str:
+            try:
+                direct_expense = float(direct_str)
+                regular_expense = float(regular_str)
+                has_expense_data = True
+            except (ValueError, TypeError):
+                has_expense_data = False
+    
+    # ❌ If no expense data, return error with helpful message
+    if not has_expense_data:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Expense ratio data not available",
+                "message": f"Sorry, we don't have expense ratio data for {fund_name}. Please try another fund.",
+                "fund_name": fund_name,
+                "suggestion": "Choose a fund with complete expense ratio information for accurate comparison."
+            }
+        )
+    
+    # Expected return (use fund's CAGR or default)
+    expected_return = 12.0  # Default 12%
+    if metrics and metrics.get('cagr'):
+        expected_return = metrics['cagr'] * 100
+    
+    # ========== LUMPSUM CALCULATION ==========
+    if request.investment_type == "lumpsum":
+        amount = request.amount
+        years = request.duration_years
+        
+        # Direct plan
+        direct_rate = (expected_return - direct_expense) / 100
+        direct_value = amount * ((1 + direct_rate) ** years)
+        
+        # Regular plan
+        regular_rate = (expected_return - regular_expense) / 100
+        regular_value = amount * ((1 + regular_rate) ** years)
+        
+        direct_returns = direct_value - amount
+        regular_returns = regular_value - amount
+        invested_amount = amount
+        
+    # ========== SIP CALCULATION ==========
+    else:  # SIP
+        monthly_sip = request.amount
+        months = request.duration_years * 12
+        invested_amount = monthly_sip * months
+        
+        # Direct plan SIP
+        direct_monthly_rate = (expected_return - direct_expense) / 100 / 12
+        if direct_monthly_rate > 0:
+            direct_value = monthly_sip * (
+                ((1 + direct_monthly_rate) ** months - 1) / direct_monthly_rate
+            ) * (1 + direct_monthly_rate)
+        else:
+            direct_value = invested_amount
+        
+        # Regular plan SIP
+        regular_monthly_rate = (expected_return - regular_expense) / 100 / 12
+        if regular_monthly_rate > 0:
+            regular_value = monthly_sip * (
+                ((1 + regular_monthly_rate) ** months - 1) / regular_monthly_rate
+            ) * (1 + regular_monthly_rate)
+        else:
+            regular_value = invested_amount
+        
+        direct_returns = direct_value - invested_amount
+        regular_returns = regular_value - invested_amount
+        amount = invested_amount
+    
+    # ========== CALCULATE SAVINGS ==========
+    savings_amount = direct_value - regular_value
+    savings_per_year = savings_amount / request.duration_years
+    
+    if regular_value > 0:
+        savings_percentage = ((direct_value - regular_value) / regular_value) * 100
+    else:
+        savings_percentage = 0
+    
+    # Effective CAGR
+    if amount > 0 and direct_value > 0 and regular_value > 0:
+        direct_cagr = ((direct_value / amount) ** (1 / request.duration_years) - 1) * 100
+        regular_cagr = ((regular_value / amount) ** (1 / request.duration_years) - 1) * 100
+    else:
+        direct_cagr = 0
+        regular_cagr = 0
+    
+    # ========== RETURN RESPONSE ==========
+    return {
+        "fund_name": fund_name,
+        "investment_type": request.investment_type,
+        "duration_years": request.duration_years,
+        "invested_amount": round(invested_amount, 2),
+        "direct_plan": {
+            "expense_ratio": round(direct_expense, 2),
+            "final_value": round(direct_value, 2),
+            "returns": round(direct_returns, 2),
+            "effective_cagr": round(direct_cagr, 2)
+        },
+        "regular_plan": {
+            "expense_ratio": round(regular_expense, 2),
+            "final_value": round(regular_value, 2),
+            "returns": round(regular_returns, 2),
+            "effective_cagr": round(regular_cagr, 2)
+        },
+        "savings": {
+            "amount": round(savings_amount, 2),
+            "per_year": round(savings_per_year, 2),
+            "percentage": round(savings_percentage, 2)
+        },
+        "verdict": f"Direct plan saves you ₹{round(savings_amount/100000, 2)} lakhs! Always choose Direct plans to avoid distributor commissions."
+    }
+
+
+# ===================================================
+# PORTFOLIO VIBE CHECK MODELS & ENDPOINT
+# ===================================================
+
+
+@app.post("/api/portfolio/analyze")
+async def analyze_portfolio(request: PortfolioAnalysisRequest):
+    """
+    Gen-Z Portfolio Vibe Check ⚡
+    Relies on Frontend Mapping. Safely calculates returns and AI Vibes.
+    """
+    results = []
+    total_invested = 0
+    total_current_value = 0
+    category_breakdown = {}
+
+    for item in request.items:
+        try:
+            # 1. Use the AMFI code provided by the React Native mapping
+            resolved_code = item.amfi_code
+            
+            if not resolved_code:
+                results.append({
+                    "fund_name": item.fund_name, 
+                    "error": True, 
+                    "message": "Missing AMFI code. Please map the fund correctly."
+                })
+                continue
+
+            # 2. Calculate Returns
+            analysis = calculate_returns(
+                scheme_code=resolved_code, 
+                investment_amount=item.invested_amount, 
+                investment_date=item.invested_date, 
+                investment_type=item.investment_type
+            )
+            
+            if analysis.get('error'):
+                results.append({"fund_name": item.fund_name, "error": True, "message": analysis['message']})
+                continue
+
+            # 3. Safely fetch details and recommendations
+            fund_details = get_fund_details(str(resolved_code)) or {}
+            recs_data = get_recommendations(str(resolved_code), limit=1) or {}
+            
+            best_alt = recs_data.get('recommendations', [None])[0] if recs_data.get('recommendations') else None
+            
+            # Safely extract score in case it's null in the database
+            score_obj = fund_details.get('score') or {}
+            score = score_obj.get('total', 0)
+            
+            should_rebalance = best_alt and best_alt.get('score_difference', 0) > 10
+            verdict = "Rebalance" if should_rebalance else "Keep"
+
+            true_invested = analysis['investment']['amount'] 
+            total_invested += true_invested
+            total_current_value += analysis['current']['value']
+            
+            cat = fund_details.get('main_category', 'Other')
+            category_breakdown[cat] = category_breakdown.get(cat, 0) + analysis['current']['value']
+
+            results.append({
+                "fund_name": item.fund_name, # Mapped name from frontend
+                "amfi_code": resolved_code,
+                "current_value": round(analysis['current']['value'], 2),
+                "returns": analysis['returns'],
+                "score": score,
+                "verdict": verdict,
+                "status": "W" if analysis['returns']['absolute'] > 0 else "L",
+                "recommendation": best_alt,
+                "category": cat,
+                "category_emoji": fund_details.get('category_emoji', '📊')
+            })
+            
+        except Exception as e:
+            print(f"❌ Error processing {item.fund_name}: {str(e)}")
+            results.append({
+                "fund_name": item.fund_name,
+                "error": True,
+                "message": "Backend calculation failed for this fund."
+            })
+
+    net_aura = round(((total_current_value - total_invested) / total_invested * 100), 2) if total_invested > 0 else 0
+
+    # ---------------------------------------------------------
+    # CRASH-PROOF LLM CALL FOR VIBE CHECK
+    # ---------------------------------------------------------
+    ai_message = ""
+    try:
+        llm = get_llm_provider()
+        prompt = f"""
+        Analyze this user's mutual fund portfolio:
+        - Total Invested: ₹{total_invested:,.2f}
+        - Current Value: ₹{total_current_value:,.2f}
+        - Net Return (Aura): {net_aura}%
+        - Category Breakdown: {category_breakdown}
+        
+        Give a 1-2 sentence Gen-Z style "Toast" or "Roast" about this portfolio. 
+        Use terms like 'Aura', 'W', 'L', 'Bestie', 'Main Character' if appropriate.
+        Be funny, supportive, and helpful. Do not use markdown bolding or asterisks.
+        """
+        # Inline system prompt to avoid import errors
+        system_prompt = "You are a Gen-Z financial advisor bestie who loves mutual funds and speaks entirely in internet slang."
+        
+        ai_message = llm.generate(prompt, system_prompt=system_prompt, max_tokens=100)
+        ai_message = ai_message.strip().strip('"').strip("'")
+        
+    except Exception as e:
+        print(f"⚠️ LLM Error generating vibe check: {e}")
+        # Safe Fallbacks
+        if net_aura > 15:
+            ai_message = "Your portfolio is giving main character energy! 🔥 Absolute W."
+        elif net_aura > 0:
+            ai_message = "We are in the green, bestie. Keep stacking those SIPs. 📈"
+        else:
+            ai_message = "Oof, bestie. The vibes are slightly off. Time to look at those rebalance alerts. 💀"
+
+    return {
+        "vibe_check": {
+            "total_invested": round(total_invested, 2),
+            "current_value": round(total_current_value, 2),
+            "net_aura": net_aura,
+            "category_distribution": category_breakdown,
+            "ai_message": ai_message
+        },
+        "funds": results
+    }
+
 
 
 if __name__ == "__main__":
